@@ -13,7 +13,13 @@ import (
 )
 
 type Attestation struct {
-	Type string `json:"type"`
+	Type         string       `json:"type"`
+	RegoPolicies []RegoPolicy `json:"regoPolicies,omitempty"`
+}
+
+type RegoPolicy struct {
+	Name   string `json:"name"`
+	Module string `json:"module"`
 }
 
 type CertConstraint struct {
@@ -76,48 +82,91 @@ func main() {
 		log.Fatal("Policy expired")
 	}
 
+	for _, step := range policy.Steps {
+		fmt.Printf("Step: %s\n", step.Name)
+		for _, attestation := range step.Attestations {
+			fmt.Printf("Attestation type: %s\n", attestation.Type)
+			for _, regoPolicy := range attestation.RegoPolicies {
+
+				fmt.Printf("Rego policy name: %s\n", regoPolicy.Name)
+
+				// Base64 decode the Rego policy
+				decodedRegoPolicy, err := base64.StdEncoding.DecodeString(regoPolicy.Module)
+				if err != nil {
+					log.Fatalf("Error decoding Rego policy for step '%s', attestation '%s': %v",
+						step.Name, attestation.Type, err)
+				}
+
+				fmt.Printf("Rego policy module: %s\n", decodedRegoPolicy)
+
+			}
+		}
+		fmt.Println("---------------------------------------")
+	}
+
+	// check that roots exist for all functionaries
+	for _, step := range policy.Steps {
+		for _, functionary := range step.Functionaries {
+			for _, fRoot := range functionary.CertConstraint.Roots {
+
+				foundRoot := false
+				for k, _ := range policy.Roots {
+					if fRoot == k {
+						foundRoot = true
+						break
+					}
+				}
+				if !foundRoot {
+					log.Fatalf("Error: Functionary '%s' for step '%s' not found in Roots. "+
+						"Please make sure the root exists in the policy's 'Roots' slice.",
+						fRoot, step.Name)
+				}
+			}
+		}
+	}
+
 	for i, root := range policy.Roots {
 		pemBytes, err := base64.StdEncoding.DecodeString(root.Certificate)
 		if err != nil {
-			log.Fatalf("Error decoding certificate for root %d: %v", i, err)
+			log.Fatalf("Error decoding certificate for root %s: %v", i, err)
 		}
 
 		// Decode the PEM-encoded certificate
 		block, _ := pem.Decode(pemBytes)
 		if block == nil {
-			log.Fatalf("Error decoding PEM block for root %d", i)
+			log.Fatalf("Error decoding PEM block for root %s", i)
 		}
 
 		// Parse the certificate
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			log.Fatalf("Error parsing certificate for root %d: %v", i, err)
+			log.Fatalf("Error parsing certificate for root %s: %v", i, err)
 		}
 
 		// Print the certificate subject for verification
-		fmt.Printf("Root %d Subject: %s\n", i, cert.Subject)
+		fmt.Printf("Root %s Subject: %s\n", i, cert.Subject)
 	}
 
 	for i, root := range policy.TimestampAuthorities {
 		pemBytes, err := base64.StdEncoding.DecodeString(root.Certificate)
 		if err != nil {
-			log.Fatalf("Error decoding certificate for root %d: %v", i, err)
+			log.Fatalf("Error decoding certificate for root %s: %v", i, err)
 		}
 
 		// Decode the PEM-encoded certificate
 		block, _ := pem.Decode(pemBytes)
 		if block == nil {
-			log.Fatalf("Error decoding PEM block for root %d", i)
+			log.Fatalf("Error decoding PEM block for root %s", i)
 		}
 
 		// Parse the certificate
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			log.Fatalf("Error parsing certificate for root %d: %v", i, err)
+			log.Fatalf("Error parsing certificate for root %s: %v", i, err)
 		}
 
 		// Print the certificate subject for verification
-		fmt.Printf("Root %d Subject: %s\n", i, cert.Subject)
+		fmt.Printf("Root %s Subject: %s\n", i, cert.Subject)
 	}
 
 	// output step information
