@@ -4,10 +4,12 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
+	"github.com/open-policy-agent/opa/ast"
 	"github.com/spf13/cobra"
 	"github.com/testifysec/go-witness/policy"
 )
@@ -77,6 +79,15 @@ func CheckPolicy(p *policy.Policy) []error {
 
 	// Check that roots exist for all functionaries
 	for _, step := range p.Steps {
+		for _, att := range step.Attestations {
+			for _, module := range att.RegoPolicies {
+				err := ValidateRegoModule(module.Module)
+				if err != nil {
+					errors = append(errors, fmt.Errorf("error: module '%s' for step '%s' is not valid: %v", module, step.Name, err))
+				}
+			}
+		}
+
 		for _, functionary := range step.Functionaries {
 			for _, fRoot := range functionary.CertConstraint.Roots {
 
@@ -97,9 +108,18 @@ func CheckPolicy(p *policy.Policy) []error {
 	// Check root certificates
 	for k, v := range p.Roots {
 
-		cert, err := x509.ParseCertificate(v.Certificate)
+		//base64 decode the root certificate to get the pem
+		block, _ := pem.Decode([]byte(v.Certificate))
+		if block == nil {
+			errors = append(errors, fmt.Errorf("error: root certificate '%s' is not a valid PEM block", k))
+			return errors
+		}
+
+		//parse the pem to get the x509 certificate
+		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
 			errors = append(errors, fmt.Errorf("error: root certificate '%s' is not a valid x509 certificate: %v", k, err))
+			return errors
 		}
 
 		// Check that the root certificate is not expired
@@ -193,20 +213,23 @@ func CheckPolicy(p *policy.Policy) []error {
 			errors = append(errors, fmt.Errorf("error: timestamp authority certificate '%s' has an invalid public key: %v", k, err))
 		}
 
-		// Check that the timestamp authority certificate has a valid timestamp authority
-		if cert.ExtKeyUsage[0] != x509.ExtKeyUsageTimeStamping {
-			errors = append(errors, fmt.Errorf("error: timestamp authority certificate '%s' has an invalid timestamp authority", k))
-		}
-
-		// Check that the timestamp authority certificate has a valid timestamp authority
-		if cert.KeyUsage != x509.KeyUsageDigitalSignature {
-			errors = append(errors, fmt.Errorf("error: timestamp authority certificate '%s' has an invalid timestamp authority", k))
-		}
-
 		// check that the expiration date is not before the policy expiration date
 		if cert.NotAfter.Before(p.Expires) {
 			errors = append(errors, fmt.Errorf("error: timestamp authority certificate '%s' has an expiration date before the policy expiration date", k))
 		}
 	}
 	return errors
+}
+
+func ValidateRegoModule(module []byte) error {
+
+	parsed, err := ast.ParseModule("my_module.rego", string(module))
+	if err != nil {
+		return fmt.Errorf("failed to parse Rego module: %v", err)
+	}
+	compiler := ast.NewCompiler()
+	if compiler.Compile(map[string]*ast.Module{"my_module": parsed}); compiler.Failed() {
+		return errors.New("failed to compile Rego module")
+	}
+	return nil
 }

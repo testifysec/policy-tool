@@ -13,12 +13,27 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/testifysec/go-witness/attestation"
+	"github.com/testifysec/go-witness/dsse"
+	"github.com/testifysec/go-witness/intoto"
 	"github.com/testifysec/go-witness/policy"
+	"gopkg.in/yaml.v2"
 )
+
+var archivistaURL *string
+
+type parsedCollection struct {
+	attestation.Collection
+	Attestations []struct {
+		Type        string          `json:"type"`
+		Attestation json.RawMessage `json:"attestation"`
+	} `json:"attestations"`
+}
 
 func CreateCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -41,11 +56,16 @@ Flags must come after the step they are bound to. For example, the -r flag must 
 		},
 	}
 
+	archivistaURL = cmd.Flags().StringP("archivsita-url", "u", "https://archivista.testifysec.io/download/", "URL of the Archivista instance to use for DSSE envelope retrieval")
+	cmd.Flags().StringP("dsse", "d", "", "Path to a DSSE envelope file to associate with an functionary, should be used instread of a step flag")
+	cmd.Flags().StringP("dsse-archivista", "x", "", "gitoid of the DSSE envelope in Archivista; should be used instead of a step flag")
+	cmd.Flags().StringP("sticky-keys", "y", "", "Path to a file containing a list of sticky keys to use for the policy")
 	cmd.Flags().StringP("step", "s", "", "Step name to bind subsequent flags to (e.g., root CA, intermediate, attestations, Rego policy)")
 	cmd.Flags().StringP("tsa-ca", "t", "", "Path to the TSA CA PEM file; should be used after a step flag")
 	cmd.Flags().StringP("root-ca", "r", "", "Path to the root CA PEM file; should be used after a step flag")
 	cmd.Flags().StringP("intermediate", "i", "", "Path to the intermediate PEM file (optional); should be used after a step flag")
 	cmd.Flags().StringP("attestations", "a", "", "Attestations to include in the policy for a step; should be used after a step flag")
+
 	cmd.Flags().StringP("rego", "g", "", "Path to a Rego policy file to associate with an attestation; should be used after an attestation flag")
 	cmd.Flags().StringP("public-key", "k", "", "Path to a public key file to associate with an attestation; should be used after a step flag")
 
@@ -57,8 +77,6 @@ Flags must come after the step they are bound to. For example, the -r flag must 
 	cmd.Flags().String("constraint-uris", "", "Certificate URIs constraint (comma-separated)")
 	cmd.Flags().StringP("output", "o", "", "Output file to save the policy (default id stdout)")
 	cmd.Flags().DurationP("expires", "e", time.Hour*24, "Expiration duration for the policy (e.g., 24h, 7d)")
-
-	cmd.MarkFlagRequired("step")
 
 	//make sure we have either a root-ca or public-key, we need one or the other
 
@@ -83,22 +101,59 @@ func CreatePolicy(args []string, expires time.Duration) error {
 		return errors.New("must provide at least one root CA or public key")
 	}
 
-	steps, err := parseArgs(args)
+	//check to see if we have a dsse file or dsse archivista id
+	hasDSSE := false
+
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-d") || strings.HasPrefix(arg, "-x") {
+			hasDSSE = true
+		}
+
+		if strings.HasPrefix(arg, "--dsse") || strings.HasPrefix(arg, "--dsse-archivista") {
+			hasDSSE = true
+		}
+	}
+
+	//check to see if we have a step name flag
+	hasStep := false
+
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-s") {
+			hasStep = true
+		}
+
+		if strings.HasPrefix(arg, "--step") {
+			hasStep = true
+
+		}
+
+	}
+
+	if !hasStep && !hasDSSE {
+		return errors.New("must provide a step name and a dsse file or dsse archivista id")
+	}
+
+	if hasStep && hasDSSE {
+		return errors.New("cannot provide both a dsse file and a step name")
+	}
+
+	//raw is a lazy hack to get around the fact that we need to parse the args twice
+	steps, raw, err := parseArgs(args)
 	if err != nil {
 		return err
 	}
 
-	roots, err := parseRoots(steps)
+	roots, err := parseRoots(raw)
 	if err != nil {
 		return err
 	}
 
-	pubKeys, err := parsePublicKeys(steps)
+	pubKeys, err := parsePublicKeys(raw)
 	if err != nil {
 		return err
 	}
 
-	tsas, err := parseTSA(steps)
+	tsas, err := parseTSA(raw)
 	if err != nil {
 		return err
 	}
@@ -108,7 +163,7 @@ func CreatePolicy(args []string, expires time.Duration) error {
 		Roots:                roots,
 		TimestampAuthorities: createTimestampAuthorities(tsas),
 		PublicKeys:           pubKeys,
-		Steps:                createSteps(steps),
+		Steps:                steps,
 	}
 
 	policyBytes, err := json.MarshalIndent(p, "", "  ")
@@ -118,6 +173,66 @@ func CreatePolicy(args []string, expires time.Duration) error {
 
 	fmt.Println(string(policyBytes))
 	return nil
+}
+
+// https://archivista.testifysec.io/download/354754c3452052ec52da4ecf2022257c4bf045f2b181b812162e012b6ad4b162
+// function parses the attestationCollection from the file or url provides
+func parseAttestationCollectionFromFile(filePath string) ([]policy.Attestation, *parsedCollection, error) {
+	//lets get the bytes from the file or url first
+	var b []byte
+
+	if strings.HasPrefix(filePath, "http") {
+		resp, err := http.Get(filePath)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, nil, fmt.Errorf("failed to download attestation collection: %s", resp.Status)
+
+		}
+
+		b, err = ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return nil, nil, err
+		}
+
+	} else {
+		//read the file
+		var err error
+		b, err = ioutil.ReadFile(filePath)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	envelope := &dsse.Envelope{}
+	if err := json.Unmarshal(b, envelope); err != nil {
+		return nil, nil, err
+	}
+
+	payload := &intoto.Statement{}
+	if err := json.Unmarshal(envelope.Payload, payload); err != nil {
+		return nil, nil, err
+	}
+
+	parsedCollection := &parsedCollection{}
+	if err := json.Unmarshal(payload.Predicate, parsedCollection); err != nil {
+		return nil, nil, err
+	}
+
+	attestations := make([]policy.Attestation, 0, len(parsedCollection.Attestations))
+
+	for _, a := range parsedCollection.Attestations {
+		attestations = append(attestations, policy.Attestation{
+			Type:         a.Type,
+			RegoPolicies: []policy.RegoPolicy{},
+		})
+	}
+
+	return attestations, parsedCollection, nil
 }
 
 func parsePublicKeys(steps map[string][]string) (map[string]policy.PublicKey, error) {
@@ -142,23 +257,6 @@ func parsePublicKeys(steps map[string][]string) (map[string]policy.PublicKey, er
 	return pubKeys, nil
 }
 
-func createSteps(steps map[string][]string) map[string]policy.Step {
-	stepsMap := make(map[string]policy.Step)
-
-	for stepName, flags := range steps {
-		stepAttestations := parseAttestationsFromFlags(flags)
-		stepFunctionaries := parseFunctionariesFromFlags(flags)
-		stepsMap[stepName] = policy.Step{
-			Name:          stepName,
-			Functionaries: stepFunctionaries,
-			Attestations:  stepAttestations,
-			ArtifactsFrom: []string{},
-		}
-	}
-
-	return stepsMap
-}
-
 func parseFunctionariesFromFlags(flags []string) []policy.Functionary {
 	var functionaries []policy.Functionary
 
@@ -170,11 +268,19 @@ func parseFunctionariesFromFlags(flags []string) []policy.Functionary {
 		URIs:          []string{"*"},
 		Roots:         []string{},
 	}
+	foundRoot := false
 
 	for _, flag := range flags {
-		foundRoot := false
+
 		switch {
 		case strings.HasPrefix(flag, "-k") || strings.HasPrefix(flag, "--public-key"):
+			if foundRoot {
+
+				functionaries = append(functionaries, policy.Functionary{
+					Type:           "root",
+					CertConstraint: certConstraint,
+				})
+			}
 
 			filePath := strings.TrimPrefix(strings.TrimPrefix(flag, "-k"), "--public-key")
 			filePath = strings.TrimSpace(strings.TrimPrefix(filePath, "="))
@@ -190,6 +296,14 @@ func parseFunctionariesFromFlags(flags []string) []policy.Functionary {
 			})
 
 		case strings.HasPrefix(flag, "-r") || strings.HasPrefix(flag, "--root-ca"):
+			if foundRoot {
+
+				functionaries = append(functionaries, policy.Functionary{
+					Type:           "root",
+					CertConstraint: certConstraint,
+				})
+			}
+
 			foundRoot = true
 			filePath := strings.TrimPrefix(strings.TrimPrefix(flag, "-r"), "--root-ca")
 			filePath = strings.TrimSpace(strings.TrimPrefix(filePath, "="))
@@ -199,9 +313,10 @@ func parseFunctionariesFromFlags(flags []string) []policy.Functionary {
 				return nil
 			}
 
-			h := sha256.Sum256(cert.Raw)
+			h := sha256.Sum256(cert)
 			hexEncoded := hex.EncodeToString(h[:])
 			certConstraint.Roots = append(certConstraint.Roots, hexEncoded)
+
 		case strings.HasPrefix(flag, "--constraint-commonname"):
 			certConstraint.CommonName = strings.TrimSpace(strings.TrimPrefix(flag, "--constraint-commonname="))
 		case strings.HasPrefix(flag, "--constraint-dnsnames"):
@@ -221,14 +336,14 @@ func parseFunctionariesFromFlags(flags []string) []policy.Functionary {
 
 		}
 
-		if foundRoot {
+	}
 
-			functionaries = append(functionaries, policy.Functionary{
-				Type:           "root",
-				CertConstraint: certConstraint,
-			})
-		}
+	if foundRoot {
 
+		functionaries = append(functionaries, policy.Functionary{
+			Type:           "root",
+			CertConstraint: certConstraint,
+		})
 	}
 
 	return functionaries
@@ -253,16 +368,16 @@ func parseKeyFromFile(filePath string) (policy.PublicKey, error) {
 	}
 
 	// Parse the X.509 certificate
-	cert, err := x509.ParseCertificate(block.Bytes)
+	_, err = x509.ParseCertificate(block.Bytes)
 	if err != nil {
 		return pk, err
 	}
 
 	//keyid is the sha256 hash of the cert.raw
-	h := sha256.Sum256(cert.Raw)
+	h := sha256.Sum256(certPEM)
 	hexEncoded := hex.EncodeToString(h[:])
 	pk.KeyID = hexEncoded
-	pk.Key = cert.Raw
+	pk.Key = certPEM
 
 	return pk, nil
 }
@@ -319,21 +434,21 @@ func loadAndEncodeRegoPolicy(filePath string) ([]byte, error) {
 	return []byte(encodedRegoPolicy), nil
 }
 
-func createTimestampAuthorities(tsas []*x509.Certificate) map[string]policy.Root {
+func createTimestampAuthorities(tsas [][]byte) map[string]policy.Root {
 	timestampAuthorities := make(map[string]policy.Root)
 
 	for _, cert := range tsas {
-		h := sha256.Sum256(cert.Raw)
+		h := sha256.Sum256(cert)
 		timestampAuthorities[hex.EncodeToString(h[:])] = policy.Root{
-			Certificate: cert.Raw,
+			Certificate: cert,
 		}
 	}
 
 	return timestampAuthorities
 }
 
-func parseTSA(steps map[string][]string) ([]*x509.Certificate, error) {
-	var tsaCerts []*x509.Certificate
+func parseTSA(steps map[string][]string) ([][]byte, error) {
+	var tsaCerts [][]byte
 
 	for _, flags := range steps {
 		for _, flag := range flags {
@@ -359,8 +474,8 @@ func parseRoots(steps map[string][]string) (map[string]policy.Root, error) {
 	roots := make(map[string]policy.Root)
 
 	for _, flags := range steps {
-		var rootCert *x509.Certificate
-		intermediateCerts := []*x509.Certificate{}
+		var rootCert []byte
+		intermediateCerts := [][]byte{}
 
 		for _, flag := range flags {
 			var filePath string
@@ -387,17 +502,17 @@ func parseRoots(steps map[string][]string) (map[string]policy.Root, error) {
 		}
 
 		if rootCert != nil {
-			certSHA := sha256.Sum256(rootCert.Raw)
+			certSHA := sha256.Sum256(rootCert)
 			certHash := hex.EncodeToString(certSHA[:])
 
 			intermediates := [][]byte{}
 
 			for _, intermediate := range intermediateCerts {
-				intermediates = append(intermediates, intermediate.Raw)
+				intermediates = append(intermediates, intermediate)
 			}
 
 			roots[certHash] = policy.Root{
-				Certificate:   rootCert.Raw,
+				Certificate:   rootCert,
 				Intermediates: intermediates,
 			}
 
@@ -407,38 +522,190 @@ func parseRoots(steps map[string][]string) (map[string]policy.Root, error) {
 	return roots, nil
 }
 
-// parseArgs function takes command line arguments and organizes them into a map where the keys are step names and the values are slices of flags belonging to those steps.
-// Each flag will be bound to the previous step flag encountered in the command line arguments.
-func parseArgs(args []string) (map[string][]string, error) {
-	steps := make(map[string][]string)
-	currentStep := ""
+func parseArgs(args []string) (map[string]policy.Step, map[string][]string, error) {
+	steps := make(map[string]policy.Step)
+	stepsTemp := make(map[string][]string)
+
+	var currentStep string
+	var currentCollection *parsedCollection
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 
-		if isStepFlag(arg) {
+		switch {
+		case isStickyKeysFileFlag(arg):
+			arg := strings.TrimPrefix(strings.TrimPrefix(arg, "-y"), "--sticky-keys")
+			arg = strings.TrimPrefix(arg, "=")
+			filepath := strings.TrimSpace(arg)
+
+			if filepath == "" {
+				i++
+				if i < len(args) {
+					filepath = args[i]
+				} else {
+					return nil, nil, fmt.Errorf("missing file path after %s", arg)
+				}
+			}
+
+			stickyKeys := make(map[string][]string)
+
+			file, err := os.Open(filepath)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to open sticky keys file %s: %v", filepath, err)
+			}
+
+			err = yaml.NewDecoder(file).Decode(&stickyKeys)
+			if err != nil {
+				return nil, nil, fmt.Errorf("failed to unmarshal sticky keys file %s: %v", filepath, err)
+			}
+
+			regoModules, err := generateRegoModules(stickyKeys, currentCollection.Attestations)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			//add the rego modules to the current step
+			for key, module := range regoModules {
+				// Base64 encode the rego module so it can be passed as a []byte
+				// Make module string into a []byte
+				modulebytes := []byte(module)
+
+				attestation := policy.Attestation{
+					Type:         key,
+					RegoPolicies: []policy.RegoPolicy{{Module: modulebytes, Name: fmt.Sprintf("%s-%s", currentStep, key)}},
+				}
+
+				//find the attestation witht the same type as the current key
+				//if it exists, append the rego policy to the existing attestation
+				//if it doesn't exist, create a new attestation and append it to the step
+				found := false
+
+				for i, a := range steps[currentStep].Attestations {
+					if a.Type == key {
+						steps[currentStep].Attestations[i].RegoPolicies = append(steps[currentStep].Attestations[i].RegoPolicies, attestation.RegoPolicies[0])
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					//just print an warning to std err and continue
+					fmt.Fprintf(os.Stderr, "WARNING: no attestation found for type %s, skipping sticky keys for this attestation", key)
+				}
+
+			}
+
+		case isDSSEFileFlag(arg):
+			arg := strings.TrimPrefix(strings.TrimPrefix(arg, "-d"), "--dsse")
+			arg = strings.TrimPrefix(arg, "=")
+			filepath := strings.TrimSpace(arg)
+
+			if filepath == "" {
+				i++
+				if i < len(args) {
+					filepath = args[i]
+				} else {
+					return nil, nil, fmt.Errorf("missing file path after %s", arg)
+				}
+			}
+			attestations, parsedCollection, err := parseAttestationCollectionFromFile(filepath)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			stepName := parsedCollection.Name
+			steps[stepName] = policy.Step{
+				Attestations: attestations,
+				Name:         stepName,
+			}
+			currentStep = stepName
+			currentCollection = parsedCollection
+
+		case isDSSEArchivistaFlag(arg):
+			arg := strings.TrimPrefix(strings.TrimPrefix(arg, "-x"), "--dsse-archivista")
+			//trim "=" and any whitespace from the beginning of the string
+			arg = strings.TrimPrefix(arg, "=")
+			arg = strings.TrimSpace(arg)
+			url := *archivistaURL + arg
+
+			if url == *archivistaURL {
+				i++
+				if i < len(args) {
+					url = *archivistaURL + args[i]
+				} else {
+					return nil, nil, fmt.Errorf("missing Archivista URL path after %s", arg)
+				}
+			}
+			attestations, parsedCollection, err := parseAttestationCollectionFromFile(url)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			stepName := parsedCollection.Name
+
+			steps[stepName] = policy.Step{
+				Attestations: attestations,
+				Name:         stepName,
+			}
+			currentStep = stepName
+			currentCollection = parsedCollection
+
+		case isStepFlag(arg):
 			stepName, newIndex, err := parseStepFlag(args, i)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			i = newIndex
 			currentStep = stepName
-			steps[currentStep] = []string{}
-		} else if strings.HasPrefix(arg, "-") {
-			if currentStep == "" {
-				return nil, fmt.Errorf("argument %s is not bound to a step flag", arg)
-			}
+			steps[currentStep] = policy.Step{}
 
+		case strings.HasPrefix(arg, "-"):
+			if currentStep == "" {
+				return nil, nil, fmt.Errorf("argument %s is not bound to a step flag", arg)
+			}
 			flagWithValue, newIndex, err := parseFlagWithValue(args, i)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			i = newIndex
-			steps[currentStep] = append(steps[currentStep], flagWithValue)
+			stepsTemp[currentStep] = append(stepsTemp[currentStep], flagWithValue)
 		}
 	}
 
-	return steps, nil
+	// Process temporary steps and merge them into main steps.
+	for stepName, flags := range stepsTemp {
+		tempStep := policy.Step{
+			Attestations:  parseAttestationsFromFlags(flags),
+			Functionaries: parseFunctionariesFromFlags(flags),
+			Name:          stepName,
+		}
+		steps[stepName] = mergeSteps(steps[stepName], tempStep)
+	}
+
+	return steps, stepsTemp, nil
+}
+
+// Merge two steps, giving preference to the functionaries from step2 if they exist.
+func mergeSteps(step1, step2 policy.Step) policy.Step {
+	if step2.Functionaries != nil {
+		step1.Functionaries = step2.Functionaries
+	}
+	if step2.Attestations != nil {
+		step1.Attestations = step2.Attestations
+	}
+	return step1
+}
+
+func isStickyKeysFileFlag(arg string) bool {
+	return strings.HasPrefix(arg, "-y") || strings.HasPrefix(arg, "--sticky-keys")
+}
+
+func isDSSEFileFlag(arg string) bool {
+	return strings.HasPrefix(arg, "-d") || strings.HasPrefix(arg, "--dsse")
+}
+
+func isDSSEArchivistaFlag(arg string) bool {
+	return strings.HasPrefix(arg, "-x") || strings.HasPrefix(arg, "--dsse-archivista")
 }
 
 func isStepFlag(arg string) bool {
@@ -482,37 +749,180 @@ func parseFlagWithValue(args []string, index int) (string, int, error) {
 	return flagWithValue, index, nil
 }
 
-func parseCertFromFile(filePath string) (*x509.Certificate, error) {
+func parseCertFromFile(filePath string) ([]byte, error) {
+	cert := []byte{}
 	var certData []byte
 	var err error
 
 	if strings.HasPrefix(filePath, "http://") || strings.HasPrefix(filePath, "https://") {
 		resp, err := http.Get(filePath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to fetch certificate from URL %s: %v", filePath, err)
+			return cert, fmt.Errorf("failed to fetch certificate from URL %s: %v", filePath, err)
 		}
 		defer resp.Body.Close()
 
 		certData, err = ioutil.ReadAll(resp.Body)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read certificate data from URL %s: %v", filePath, err)
+			return cert, fmt.Errorf("failed to read certificate data from URL %s: %v", filePath, err)
 		}
 	} else {
 		certData, err = ioutil.ReadFile(filePath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read certificate file %s: %v", filePath, err)
+			return cert, fmt.Errorf("failed to read certificate file %s: %v", filePath, err)
 		}
 	}
 
 	block, _ := pem.Decode(certData)
 	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, fmt.Errorf("failed to decode PEM block containing certificate in file %s", filePath)
+		return cert, fmt.Errorf("failed to decode PEM block containing certificate in file %s", filePath)
 	}
 
-	cert, err := x509.ParseCertificate(block.Bytes)
+	_, err = x509.ParseCertificate(block.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse certificate from file %s: %v", filePath, err)
+		return cert, fmt.Errorf("failed to parse certificate from file %s: %v", filePath, err)
 	}
 
-	return cert, nil
+	return certData, nil
+}
+
+func getNestedValue(jsonMap map[string]interface{}, path string) (interface{}, bool) {
+	keys := strings.Split(path, ".")
+	var currentValue interface{} = jsonMap
+
+	for _, key := range keys {
+		currentMap, ok := currentValue.(map[string]interface{})
+		if !ok {
+			return nil, false
+		}
+		currentValue, ok = currentMap[key]
+		if !ok {
+			return nil, false
+		}
+	}
+
+	return currentValue, true
+}
+
+func generateRegoModules(stickyKeys map[string][]string, raw []struct {
+	Type        string          `json:"type"`
+	Attestation json.RawMessage `json:"attestation"`
+}) (map[string]string, error) {
+	keyValuePairs, err := extractKeyValues(stickyKeys, raw)
+	if err != nil {
+		return nil, err
+	}
+	regoModules, err := generateRegoModulesFromKeyValues(stickyKeys, keyValuePairs)
+	if err != nil {
+		return nil, err
+	}
+	return regoModules, nil
+}
+
+func extractKeyValues(stickyKeys map[string][]string, raw []struct {
+	Type        string          `json:"type"`
+	Attestation json.RawMessage `json:"attestation"`
+}) (map[string]map[string]interface{}, error) {
+	keyValuePairs := make(map[string]map[string]interface{})
+
+	for _, s := range raw {
+		a := make(map[string]interface{})
+		err := json.Unmarshal(s.Attestation, &a)
+		if err != nil {
+			return nil, err
+		}
+		attestationType := s.Type
+		if keys, ok := stickyKeys[attestationType]; ok {
+			keyValuePairs[attestationType] = make(map[string]interface{})
+			for _, key := range keys {
+				value, ok := getNestedValue(a, key)
+				if !ok {
+					return nil, fmt.Errorf("key %s not found in attestation type %s", key, attestationType)
+				}
+				keyValuePairs[attestationType][key] = value
+			}
+		}
+	}
+	return keyValuePairs, nil
+}
+
+func generateRegoModulesFromKeyValues(stickyKeys map[string][]string, keyValuePairs map[string]map[string]interface{}) (map[string]string, error) {
+	regoModules := make(map[string]string)
+
+	for attestationType, keys := range stickyKeys {
+		rules, err := generateRules(attestationType, keys, keyValuePairs)
+		if err != nil {
+			return nil, err
+		}
+
+		packageName := getPackageName(attestationType)
+		regoModule := createRegoModule(packageName, rules, keys, attestationType)
+		regoModules[attestationType] = regoModule
+	}
+
+	return regoModules, nil
+}
+
+func generateRules(attestationType string, keys []string, keyValuePairs map[string]map[string]interface{}) ([]string, error) {
+	var rules []string
+
+	for _, key := range keys {
+		value := keyValuePairs[attestationType][key]
+		rule, err := createRule(key, value, attestationType)
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, rule)
+	}
+
+	return rules, nil
+}
+
+func createRule(key string, value interface{}, attestationType string) (string, error) {
+	switch v := value.(type) {
+	case string:
+		return fmt.Sprintf(`input.%s != "%v"`, key, value), nil
+	case []interface{}:
+		quotedVals, err := stringifySlice(v)
+		if err != nil {
+			return "", fmt.Errorf("unexpected value type for key '%s' in attestation type '%s': expected string, got %T", key, attestationType, v)
+		}
+		return fmt.Sprintf(`input.%s != [%s]`, key, strings.Join(quotedVals, ",")), nil
+	case int, int32, int64, float32, float64:
+		return fmt.Sprintf(`input.%s != %v`, key, value), nil
+	case bool:
+		return fmt.Sprintf(`input.%s != %v`, key, value), nil
+	default:
+		return "", fmt.Errorf("unexpected value type for key '%s' in attestation type '%s': expected string, slice of strings, number, or boolean, got %T", key, attestationType, value)
+	}
+}
+
+func stringifySlice(slice []interface{}) ([]string, error) {
+	var quotedVals []string
+
+	for _, elem := range slice {
+		str, ok := elem.(string)
+		if !ok {
+			return nil, fmt.Errorf("unexpected element type: expected string, got %T", elem)
+		}
+		quotedVals = append(quotedVals, fmt.Sprintf("%q", str))
+	}
+
+	return quotedVals, nil
+}
+
+func getPackageName(attestationType string) string {
+	segments := strings.Split(attestationType, "/")
+	packageName := segments[len(segments)-2]
+	packageName = regexp.MustCompile("[^a-zA-Z0-9_]+").ReplaceAllString(packageName, "_")
+	return packageName
+}
+
+func createRegoModule(packageName string, rules []string, keys []string, attestationType string) string {
+	regoModuleTemplate := `package %s
+	deny[msg] {
+		%s
+		msg := "unexpected value for key(s) %s in attestation type %s"
+	}`
+
+	return fmt.Sprintf(regoModuleTemplate, packageName, strings.Join(rules, "\n\t"), strings.Join(keys, ", "), attestationType)
 }
