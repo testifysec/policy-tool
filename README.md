@@ -1,4 +1,4 @@
-# [Witness](http://github.com/testifysec/witness) Policy Tool
+# Witness Policy Tool
 
 The Witness Policy Tool is a command-line utility designed to create, and validate Witness policies. These policies play a crucial role in maintaining the integrity and security of your software development lifecycle (SDLC) by requiring the presence of specific attestations and values throughout every stage. To learn more about Witness, visit its [GitHub repository](http://github.com/testifysec/witness) , and for further information on policies, consult the [Witness policy documentation](https://github.com/testifysec/witness/blob/main/docs/policy.md) .
 
@@ -14,21 +14,6 @@ The tool is run from the command line and supports various commands and flags to
 To generate a [Witness](http://github.com/testifysec/witness) policy from existing attestations, you can instrument your pipeline with [Witness](http://github.com/testifysec/witness) and retrieve the gitoids for the attestations generated at each step. You can then pass these gitoids, along with the necessary CA certificates, to the policy tool to generate your policy.
 
 Additionally, the tool includes a Rego Module Generator that helps you create Rego modules for validating attestation data based on key-value pairs provided in a YAML configuration file.
-
-#### Check Command
-
-The tool is run from the command line and takes the unsigned policy file as its only argument. For example:
-
-```policy-tool check unsigned_policy_file.json```
-
-The tool will output the following information:
-
-- The steps in the policy file and the attestations associated with each step
-- The decoded Rego policy module for each attestation
-- The roots used in the policy file and the subject of each root's certificate
-- The number of steps and roots parsed from the policy file
-
-If there are any errors in the policy file, the tool will output a detailed error message with information about the error, including the step and attestation where the error occurred.
 
 ## Generating Policy From Existing Attestations
 
