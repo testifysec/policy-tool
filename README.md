@@ -2,6 +2,8 @@
 
 The Witness Policy Tool is a command-line utility designed to create, and validate Witness policies. These policies play a crucial role in maintaining the integrity and security of your software development lifecycle (SDLC) by requiring the presence of specific attestations and values throughout every stage. To learn more about Witness, visit its [GitHub repository](http://github.com/testifysec/witness) , and for further information on policies, consult the [Witness policy documentation](https://github.com/testifysec/witness/blob/main/docs/policy.md) .
 
+**This tool is experimental.  When stable this functionality will be incorporated into Witness**
+
 ## Download
 
 You can download the latest linux x64 release of `policy-tool` from [GitHub](https://github.com/testifysec/policy-tool/releases/download/v0.1.14/policy-tool).
