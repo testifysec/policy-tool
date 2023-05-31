@@ -356,31 +356,32 @@ func parseKeyFromFile(filePath string) (policy.PublicKey, error) {
 	}
 
 	// Read the file
-	certPEM, err := ioutil.ReadFile(filePath)
+	pubPEM, err := ioutil.ReadFile(filePath)
 	if err != nil {
 		return pk, err
 	}
 
 	// Decode the PEM block
-	block, _ := pem.Decode(certPEM)
+	block, _ := pem.Decode(pubPEM)
 	if block == nil {
 		return pk, errors.New("failed to decode PEM block containing the public key")
 	}
 
-	// Parse the X.509 certificate
-	_, err = x509.ParseCertificate(block.Bytes)
+	// Parse the public key
+	_, err = x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
 		return pk, err
 	}
 
-	//keyid is the sha256 hash of the cert.raw
-	h := sha256.Sum256(certPEM)
+	// keyid is the sha256 hash of the PEM
+	h := sha256.Sum256(pubPEM)
 	hexEncoded := hex.EncodeToString(h[:])
 	pk.KeyID = hexEncoded
-	pk.Key = certPEM
+	pk.Key = pubPEM
 
 	return pk, nil
 }
+
 func parseAttestationsFromFlags(flags []string) []policy.Attestation {
 	var attestations []policy.Attestation
 	var currentAttestation *policy.Attestation
