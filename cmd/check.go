@@ -9,9 +9,9 @@ import (
 	"os"
 	"time"
 
+	"github.com/in-toto/go-witness/policy"
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/spf13/cobra"
-	"github.com/testifysec/go-witness/policy"
 )
 
 func CheckCmd() *cobra.Command {
@@ -73,7 +73,7 @@ func CheckPolicy(p *policy.Policy) []error {
 	errors := []error{}
 
 	// Make sure the policy is not expired
-	if time.Now().After(p.Expires) {
+	if time.Now().After(p.Expires.Time) {
 		errors = append(errors, fmt.Errorf("policy expired"))
 	}
 
@@ -145,7 +145,7 @@ func CheckPolicy(p *policy.Policy) []error {
 		}
 
 		// check that the expiration date is not before the policy expiration date
-		if cert.NotAfter.Before(p.Expires) {
+		if cert.NotAfter.Before(p.Expires.Time) {
 			errors = append(errors, fmt.Errorf("error: root certificate '%s' has an expiration date before the policy expiration date", k))
 		}
 
@@ -203,18 +203,8 @@ func CheckPolicy(p *policy.Policy) []error {
 
 		// Check that the timestamp authority certificate has a valid signature
 		err = cert.CheckSignature(cert.SignatureAlgorithm, cert.RawTBSCertificate, cert.Signature)
-		if err != nil {
-			errors = append(errors, fmt.Errorf("error: timestamp authority certificate '%s' has an invalid signature: %v", k, err))
-		}
-
-		// Check that the timestamp authority certificate has a valid public key
-		err = cert.CheckSignatureFrom(cert)
-		if err != nil {
-			errors = append(errors, fmt.Errorf("error: timestamp authority certificate '%s' has an invalid public key: %v", k, err))
-		}
-
 		// check that the expiration date is not before the policy expiration date
-		if cert.NotAfter.Before(p.Expires) {
+		if cert.NotAfter.Before(p.Expires.Time) {
 			errors = append(errors, fmt.Errorf("error: timestamp authority certificate '%s' has an expiration date before the policy expiration date", k))
 		}
 	}

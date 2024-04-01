@@ -3,7 +3,6 @@ package cmd
 import (
 	"crypto/sha256"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -11,229 +10,72 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"net/url"
 	"os"
 	"regexp"
 	"strings"
-	"time"
 
-	"github.com/spf13/cobra"
-	"github.com/testifysec/go-witness/attestation"
-	"github.com/testifysec/go-witness/dsse"
-	"github.com/testifysec/go-witness/intoto"
-	"github.com/testifysec/go-witness/policy"
+	"context"
+
+	"github.com/in-toto/archivista/pkg/api"
+	"github.com/in-toto/go-witness/policy"
 	"gopkg.in/yaml.v2"
 )
 
+type searchResults struct {
+	Dsses struct {
+		Edges []struct {
+			Node struct {
+				GitoidSha256 string `json:"gitoidSha256"`
+				Statement    struct {
+					AttestationCollection struct {
+						Name         string `json:"name"`
+						Attestations []struct {
+							Type string `json:"type"`
+						} `json:"attestations"`
+					} `json:"attestationCollections"`
+				} `json:"statement"`
+			} `json:"node"`
+		} `json:"edges"`
+	} `json:"dsses"`
+}
+
+const searchQuery = `query($algo: String!, $digest: String!) {
+	dsses(
+	  where: {
+		hasStatementWith: {
+		  hasSubjectsWith: {
+			hasSubjectDigestsWith: {
+			  value: $digest,
+			  algorithm: $algo
+			}
+		  }
+		}
+	  }
+	) {
+	  edges {
+		node {
+		  gitoidSha256
+		  statement {
+			attestationCollections {
+			  name
+			  attestations {
+				type
+			  }
+			}
+		  }
+		}
+	  }
+	}
+  }`
+
+type searchVars struct {
+	Algorithm string `json:"algo"`
+	Digest    string `json:"digest"`
+}
+
 var archivistaURL *string
 
-type parsedCollection struct {
-	attestation.Collection
-	Attestations []struct {
-		Type        string          `json:"type"`
-		Attestation json.RawMessage `json:"attestation"`
-	} `json:"attestations"`
-}
-
-func CreateCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "create",
-		Short: "Create a policy file",
-		Long: `create -s <step1_name> -r <root_ca_path> -a <attestation> -g <rego_path> -a <attestation> -g <rego_path> \
--s <step2_name> -r <root_ca_path> -a <attestation> -g <rego_path> -a <attestation> -g <rego_path> \
--o <output_path> -e <expiration> -t <tsa_ca_path>
-					  
-Flags must come after the step they are bound to. For example, the -r flag must come after the -s flag.`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			expires, _ := cmd.Flags().GetDuration("expires")
-
-			err := CreatePolicy(os.Args[2:], expires)
-			if err != nil {
-				return fmt.Errorf("policy creation failed: %v", err)
-			}
-			return nil
-		},
-	}
-
-	archivistaURL = cmd.Flags().StringP("archivsita-url", "u", "https://archivista.testifysec.io/download/", "URL of the Archivista instance to use for DSSE envelope retrieval")
-	cmd.Flags().StringP("dsse", "d", "", "Path to a DSSE envelope file to associate with an functionary, should be used instread of a step flag")
-	cmd.Flags().StringP("dsse-archivista", "x", "", "gitoid of the DSSE envelope in Archivista; should be used instead of a step flag")
-	cmd.Flags().StringP("sticky-keys", "y", "", "Path to a file containing a list of sticky keys to use for the policy")
-	cmd.Flags().StringP("step", "s", "", "Step name to bind subsequent flags to (e.g., root CA, intermediate, attestations, Rego policy)")
-	cmd.Flags().StringP("tsa-ca", "t", "", "Path to the TSA CA PEM file; should be used after a step flag")
-	cmd.Flags().StringP("root-ca", "r", "", "Path to the root CA PEM file; should be used after a step flag")
-	cmd.Flags().StringP("intermediate", "i", "", "Path to the intermediate PEM file (optional); should be used after a step flag")
-	cmd.Flags().StringP("attestations", "a", "", "Attestations to include in the policy for a step; should be used after a step flag")
-
-	cmd.Flags().StringP("rego", "g", "", "Path to a Rego policy file to associate with an attestation; should be used after an attestation flag")
-	cmd.Flags().StringP("public-key", "k", "", "Path to a public key file to associate with an attestation; should be used after a step flag")
-
-	//flags for cert constraints
-	cmd.Flags().String("constraint-commonname", "", "Certificate common name constraint")
-	cmd.Flags().String("constraint-dnsnames", "", "Certificate DNS names constraint (comma-separated)")
-	cmd.Flags().String("constraint-emails", "", "Certificate emails constraint (comma-separated)")
-	cmd.Flags().String("constraint-organizations", "", "Certificate organizations constraint (comma-separated)")
-	cmd.Flags().String("constraint-uris", "", "Certificate URIs constraint (comma-separated)")
-	cmd.Flags().StringP("output", "o", "", "Output file to save the policy (default id stdout)")
-	cmd.Flags().DurationP("expires", "e", time.Hour*24, "Expiration duration for the policy (e.g., 24h, 7d)")
-
-	//make sure we have either a root-ca or public-key, we need one or the other
-
-	return cmd
-}
-
-func CreatePolicy(args []string, expires time.Duration) error {
-	//check to make sure we have at least one rootca or public key
-	hasKey := false
-
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-r") || strings.HasPrefix(arg, "-k") {
-			hasKey = true
-		}
-
-		if strings.HasPrefix(arg, "--root-ca") || strings.HasPrefix(arg, "--public-key") {
-			hasKey = true
-		}
-	}
-
-	if !hasKey {
-		return errors.New("must provide at least one root CA or public key")
-	}
-
-	//check to see if we have a dsse file or dsse archivista id
-	hasDSSE := false
-
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-d") || strings.HasPrefix(arg, "-x") {
-			hasDSSE = true
-		}
-
-		if strings.HasPrefix(arg, "--dsse") || strings.HasPrefix(arg, "--dsse-archivista") {
-			hasDSSE = true
-		}
-	}
-
-	//check to see if we have a step name flag
-	hasStep := false
-
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "-s") {
-			hasStep = true
-		}
-
-		if strings.HasPrefix(arg, "--step") {
-			hasStep = true
-
-		}
-
-	}
-
-	if !hasStep && !hasDSSE {
-		return errors.New("must provide a step name and a dsse file or dsse archivista id")
-	}
-
-	if hasStep && hasDSSE {
-		return errors.New("cannot provide both a dsse file and a step name")
-	}
-
-	//raw is a lazy hack to get around the fact that we need to parse the args twice
-	steps, raw, err := parseArgs(args)
-	if err != nil {
-		return err
-	}
-
-	roots, err := parseRoots(raw)
-	if err != nil {
-		return err
-	}
-
-	pubKeys, err := parsePublicKeys(raw)
-	if err != nil {
-		return err
-	}
-
-	tsas, err := parseTSA(raw)
-	if err != nil {
-		return err
-	}
-
-	p := &policy.Policy{
-		Expires:              time.Now().Add(expires),
-		Roots:                roots,
-		TimestampAuthorities: createTimestampAuthorities(tsas),
-		PublicKeys:           pubKeys,
-		Steps:                steps,
-	}
-
-	policyBytes, err := json.MarshalIndent(p, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(policyBytes))
-	return nil
-}
-
-// https://archivista.testifysec.io/download/354754c3452052ec52da4ecf2022257c4bf045f2b181b812162e012b6ad4b162
-// function parses the attestationCollection from the file or url provides
-func parseAttestationCollectionFromFile(filePath string) ([]policy.Attestation, *parsedCollection, error) {
-	//lets get the bytes from the file or url first
-	var b []byte
-
-	if strings.HasPrefix(filePath, "http") {
-		resp, err := http.Get(filePath)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			return nil, nil, fmt.Errorf("failed to download attestation collection: %s", resp.Status)
-
-		}
-
-		b, err = ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return nil, nil, err
-		}
-
-	} else {
-		//read the file
-		var err error
-		b, err = ioutil.ReadFile(filePath)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	envelope := &dsse.Envelope{}
-	if err := json.Unmarshal(b, envelope); err != nil {
-		return nil, nil, err
-	}
-
-	payload := &intoto.Statement{}
-	if err := json.Unmarshal(envelope.Payload, payload); err != nil {
-		return nil, nil, err
-	}
-
-	parsedCollection := &parsedCollection{}
-	if err := json.Unmarshal(payload.Predicate, parsedCollection); err != nil {
-		return nil, nil, err
-	}
-
-	attestations := make([]policy.Attestation, 0, len(parsedCollection.Attestations))
-
-	for _, a := range parsedCollection.Attestations {
-		attestations = append(attestations, policy.Attestation{
-			Type:         a.Type,
-			RegoPolicies: []policy.RegoPolicy{},
-		})
-	}
-
-	return attestations, parsedCollection, nil
-}
+const archivistaUrl = "https://archivista.testifysec.io"
 
 func parsePublicKeys(steps map[string][]string) (map[string]policy.PublicKey, error) {
 	pubKeys := make(map[string]policy.PublicKey)
@@ -255,98 +97,6 @@ func parsePublicKeys(steps map[string][]string) (map[string]policy.PublicKey, er
 		}
 	}
 	return pubKeys, nil
-}
-
-func parseFunctionariesFromFlags(flags []string) []policy.Functionary {
-	var functionaries []policy.Functionary
-
-	certConstraint := policy.CertConstraint{
-		CommonName:    "*",
-		DNSNames:      []string{"*"},
-		Emails:        []string{"*"},
-		Organizations: []string{"*"},
-		URIs:          []string{"*"},
-		Roots:         []string{},
-	}
-	foundRoot := false
-
-	for _, flag := range flags {
-
-		switch {
-		case strings.HasPrefix(flag, "-k") || strings.HasPrefix(flag, "--public-key"):
-			if foundRoot {
-
-				functionaries = append(functionaries, policy.Functionary{
-					Type:           "root",
-					CertConstraint: certConstraint,
-				})
-			}
-
-			filePath := strings.TrimPrefix(strings.TrimPrefix(flag, "-k"), "--public-key")
-			filePath = strings.TrimSpace(strings.TrimPrefix(filePath, "="))
-
-			key, err := parseKeyFromFile(filePath)
-			if err != nil {
-				return nil
-			}
-
-			functionaries = append(functionaries, policy.Functionary{
-				Type:        "publickey",
-				PublicKeyID: key.KeyID,
-			})
-
-		case strings.HasPrefix(flag, "-r") || strings.HasPrefix(flag, "--root-ca"):
-			if foundRoot {
-
-				functionaries = append(functionaries, policy.Functionary{
-					Type:           "root",
-					CertConstraint: certConstraint,
-				})
-			}
-
-			foundRoot = true
-			filePath := strings.TrimPrefix(strings.TrimPrefix(flag, "-r"), "--root-ca")
-			filePath = strings.TrimSpace(strings.TrimPrefix(filePath, "="))
-
-			cert, err := parseCertFromFile(filePath)
-			if err != nil {
-				return nil
-			}
-
-			h := sha256.Sum256(cert)
-			hexEncoded := hex.EncodeToString(h[:])
-			certConstraint.Roots = append(certConstraint.Roots, hexEncoded)
-
-		case strings.HasPrefix(flag, "--constraint-commonname"):
-			certConstraint.CommonName = strings.TrimSpace(strings.TrimPrefix(flag, "--constraint-commonname="))
-		case strings.HasPrefix(flag, "--constraint-dnsnames"):
-			certConstraint.DNSNames = strings.Split(strings.TrimSpace(strings.TrimPrefix(flag, "--constraint-dnsnames=")), ",")
-		case strings.HasPrefix(flag, "--constraint-emails"):
-			certConstraint.Emails = strings.Split(strings.TrimSpace(strings.TrimPrefix(flag, "--constraint-emails=")), ",")
-		case strings.HasPrefix(flag, "--constraint-organizations"):
-			certConstraint.Organizations = strings.Split(strings.TrimSpace(strings.TrimPrefix(flag, "--constraint-organizations=")), ",")
-		case strings.HasPrefix(flag, "--constraint-uris"):
-			uriStrs := strings.Split(strings.TrimSpace(strings.TrimPrefix(flag, "--constraint-uris=")), ",")
-			for _, uriStr := range uriStrs {
-				u, err := url.Parse(uriStr)
-				if err == nil {
-					certConstraint.URIs = append(certConstraint.URIs, u.String())
-				}
-			}
-
-		}
-
-	}
-
-	if foundRoot {
-
-		functionaries = append(functionaries, policy.Functionary{
-			Type:           "root",
-			CertConstraint: certConstraint,
-		})
-	}
-
-	return functionaries
 }
 
 func parseKeyFromFile(filePath string) (policy.PublicKey, error) {
@@ -382,72 +132,6 @@ func parseKeyFromFile(filePath string) (policy.PublicKey, error) {
 	return pk, nil
 }
 
-func parseAttestationsFromFlags(flags []string) []policy.Attestation {
-	var attestations []policy.Attestation
-	var currentAttestation *policy.Attestation
-
-	for _, flag := range flags {
-		if strings.HasPrefix(flag, "-a") || strings.HasPrefix(flag, "--attestations") {
-			attestation := strings.TrimPrefix(strings.TrimPrefix(flag, "-a"), "--attestations")
-			attestation = strings.TrimSpace(strings.TrimPrefix(attestation, "="))
-
-			// Append the current attestation to the slice if it has already been processed
-			if currentAttestation != nil {
-				attestations = append(attestations, *currentAttestation)
-			}
-
-			currentAttestation = &policy.Attestation{
-				Type:         attestation,
-				RegoPolicies: []policy.RegoPolicy{},
-			}
-		} else if strings.HasPrefix(flag, "-g") || strings.HasPrefix(flag, "--rego-policy") {
-			if currentAttestation == nil {
-				panic("rego policy flag must be preceded by an attestation flag")
-			}
-
-			filePath := strings.TrimPrefix(strings.TrimPrefix(flag, "-g"), "--rego-policy")
-			filePath = strings.TrimSpace(strings.TrimPrefix(filePath, "="))
-
-			regoPolicy, err := loadAndEncodeRegoPolicy(filePath)
-			if err != nil {
-				continue
-			}
-
-			currentAttestation.RegoPolicies = append(currentAttestation.RegoPolicies, policy.RegoPolicy{Name: filePath, Module: regoPolicy})
-		}
-	}
-
-	// Append the current attestation to the slice if it has already been processed
-	if currentAttestation != nil {
-		attestations = append(attestations, *currentAttestation)
-	}
-
-	return attestations
-}
-func loadAndEncodeRegoPolicy(filePath string) ([]byte, error) {
-	regoData, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read Rego policy file %s: %v", filePath, err)
-	}
-
-	encodedRegoPolicy := base64.StdEncoding.EncodeToString(regoData)
-
-	return []byte(encodedRegoPolicy), nil
-}
-
-func createTimestampAuthorities(tsas [][]byte) map[string]policy.Root {
-	timestampAuthorities := make(map[string]policy.Root)
-
-	for _, cert := range tsas {
-		h := sha256.Sum256(cert)
-		timestampAuthorities[hex.EncodeToString(h[:])] = policy.Root{
-			Certificate: cert,
-		}
-	}
-
-	return timestampAuthorities
-}
-
 func parseTSA(steps map[string][]string) ([][]byte, error) {
 	var tsaCerts [][]byte
 
@@ -470,61 +154,74 @@ func parseTSA(steps map[string][]string) ([][]byte, error) {
 	return tsaCerts, nil
 }
 
-// this function opens the pem encoded CA and intermediate files from the steps and parses them into a policy.TrustBundle with the key being the hex encoded sha256 hash of the certificate
-func parseRoots(steps map[string][]string) (map[string]policy.Root, error) {
-	roots := make(map[string]policy.Root)
+// fetchAttestations fetches attestations for given subjects from Archivista.
+func fetchAttestations(subjects []string) ([]policy.Step, error) {
+	var allSteps []policy.Step
 
-	for _, flags := range steps {
-		var rootCert []byte
-		intermediateCerts := [][]byte{}
-
-		for _, flag := range flags {
-			var filePath string
-			if strings.HasPrefix(flag, "-r") || strings.HasPrefix(flag, "--root-ca") {
-				filePath = strings.TrimPrefix(strings.TrimPrefix(flag, "-r"), "--root-ca")
-			} else if strings.HasPrefix(flag, "-i") || strings.HasPrefix(flag, "--intermediate") {
-				filePath = strings.TrimPrefix(strings.TrimPrefix(flag, "-i"), "--intermediate")
-			} else {
-				continue
-			}
-
-			filePath = strings.TrimSpace(strings.TrimPrefix(filePath, "="))
-
-			cert, err := parseCertFromFile(filePath)
-			if err != nil {
-				return nil, err
-			}
-
-			if strings.HasPrefix(flag, "-r") || strings.HasPrefix(flag, "--root-ca") {
-				rootCert = cert
-			} else if strings.HasPrefix(flag, "-i") || strings.HasPrefix(flag, "--intermediate") {
-				intermediateCerts = append(intermediateCerts, cert)
-			}
+	for _, subject := range subjects {
+		algo, digest, err := validateDigestString(subject)
+		if err != nil {
+			return nil, fmt.Errorf("invalid subject %s: %v", subject, err)
 		}
 
-		if rootCert != nil {
-			certSHA := sha256.Sum256(rootCert)
-			certHash := hex.EncodeToString(certSHA[:])
+		// Assuming api.GraphQlQuery function and archivistaUrl are accessible here
+		results, err := api.GraphQlQuery[searchResults](context.Background(), archivistaUrl, searchQuery, searchVars{Algorithm: algo, Digest: digest})
+		if err != nil {
+			return nil, fmt.Errorf("error fetching attestations for %s: %v", subject, err)
+		}
 
-			intermediates := [][]byte{}
+		for _, edge := range results.Dsses.Edges {
+			for _, attestation := range edge.Node.Statement.AttestationCollection.Attestations {
+				// Convert each attestation result into your policy.Attestation struct
+				// Note: You may need to adjust the conversion based on how your policy.Attestation is structured
+				policyAttestation := policy.Attestation{
+					Type: attestation.Type,
+				}
 
-			for _, intermediate := range intermediateCerts {
-				intermediates = append(intermediates, intermediate)
+				// Create a new step for each attestation
+				step := policy.Step{
+					Name:         edge.Node.Statement.AttestationCollection.Name,
+					Attestations: []policy.Attestation{policyAttestation},
+				}
+
+				allSteps = append(allSteps, step)
+
 			}
-
-			roots[certHash] = policy.Root{
-				Certificate:   rootCert,
-				Intermediates: intermediates,
-			}
-
 		}
 	}
 
-	return roots, nil
+	return allSteps, nil
 }
 
 func parseArgs(args []string) (map[string]policy.Step, map[string][]string, error) {
+
+	// Example: Determine commit hash from args - this logic may vary based on your command line design
+
+	// Fetch attestations by subject
+	subjects := []string{}
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-b") || strings.HasPrefix(arg, "--subjects") {
+			arg = strings.TrimPrefix(strings.TrimPrefix(arg, "-b"), "--subjects")
+			arg = strings.TrimPrefix(arg, "=")
+			subjects = append(subjects, strings.Split(arg, ",")...)
+		}
+	}
+
 	steps := make(map[string]policy.Step)
+
+	for _, subject := range subjects {
+		fmt.Printf("Fetching attestations for %s\n", subject)
+		attestations, err := fetchAttestations([]string{subject})
+		if err != nil {
+			return nil, nil, err
+		}
+
+		for _, step := range attestations {
+			steps[step.Name] = step
+		}
+
+	}
+
 	stepsTemp := make(map[string][]string)
 
 	var currentStep string
@@ -846,6 +543,45 @@ func extractKeyValues(stickyKeys map[string][]string, raw []struct {
 	return keyValuePairs, nil
 }
 
+func extractKeyValues(attestations []struct {
+	Type        string          `json:"type"`
+	Attestation json.RawMessage `json:"attestation"`
+}) (map[string]map[string]string, error) {
+	keyValuePairs := make(map[string]map[string]string)
+
+	for _, att := range attestations {
+		var attData map[string]interface{}
+		err := json.Unmarshal(att.Attestation, &attData)
+		if err != nil {
+			return nil, err
+		}
+
+		// Initialize the key value pair map for this attestation type
+		keyValuePairs[att.Type] = make(map[string]string)
+
+		for key, value := range attData {
+			switch att.Type {
+			case "https://witness.dev/attestations/material/v0.1":
+				if hashData, ok := value.(map[string]interface{}); ok {
+					if hash, ok := hashData["sha256"]; ok {
+						keyValuePairs[att.Type][key] = hash.(string)
+					}
+				}
+			case "https://witness.dev/attestations/product/v0.1":
+				if hashData, ok := value.(map[string]interface{}); ok {
+					if digest, ok := hashData["digest"].(map[string]interface{}); ok {
+						if hash, ok := digest["sha256"]; ok {
+							keyValuePairs[att.Type][key] = hash.(string)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return keyValuePairs, nil
+}
+
 func generateRegoModulesFromKeyValues(stickyKeys map[string][]string, keyValuePairs map[string]map[string]interface{}) (map[string]string, error) {
 	regoModules := make(map[string]string)
 
@@ -926,4 +662,15 @@ func createRegoModule(packageName string, rules []string, keys []string, attesta
 	}`
 
 	return fmt.Sprintf(regoModuleTemplate, packageName, strings.Join(rules, "\n\t"), strings.Join(keys, ", "), attestationType)
+}
+
+func validateDigestString(ds string) (algo, digest string, err error) {
+	fmt.Println("ds", ds)
+
+	algo, digest, found := strings.Cut(ds, ":")
+	if !found {
+		return "", "", errors.New("invalid digest string. expected algorithm:digest")
+	}
+
+	return algo, digest, nil
 }
